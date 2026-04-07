@@ -202,7 +202,7 @@ type TransferQueue struct {
 	incoming          chan *objectTuple // Channel for processing incoming items
 	errorc            chan error        // Channel for processing errors
 	watchers          []chan *Transfer
-	trMutex           *sync.Mutex
+	trMutex           *sync.RWMutex
 	collectorWait     sync.WaitGroup
 	errorwait         sync.WaitGroup
 	// wait is used to keep track of pending transfers. It is incremented
@@ -303,9 +303,9 @@ func NewTransferQueue(dir Direction, manifest Manifest, remote string, options .
 	q := &TransferQueue{
 		direction: dir,
 		remote:    remote,
-		errorc:    make(chan error),
+		errorc:    make(chan error, 64),
 		transfers: make(map[string]*objects),
-		trMutex:   &sync.Mutex{},
+		trMutex:   &sync.RWMutex{},
 		manifest:  manifest,
 		rc:        newRetryCounter(),
 		wait:      newAbortableWaitGroup(),
@@ -437,11 +437,82 @@ func (q *TransferQueue) remember(t *objectTuple) objects {
 func (q *TransferQueue) collectBatches() {
 	defer q.collectorWait.Done()
 
+	maxBatchWorkers := q.manifest.ConcurrentBatchRequests()
+
+	// batchCh carries ready-to-send batches to parallel API workers.
+	// Sized to 2x workers for a small lookahead without unbounded buffering.
+	batchCh := make(chan batch, maxBatchWorkers*2)
+
+	// retryCh collects failed transfers from all in-flight batches.
+	// Sized to accommodate retries from all workers to prevent backpressure.
+	retryCh := make(chan *objectTuple, q.batchSize*maxBatchWorkers)
+	var retryWg sync.WaitGroup
+
+	collectRetriesFrom := func(ch <-chan *objectTuple) {
+		if ch == nil {
+			return
+		}
+		retryWg.Add(1)
+		go func() {
+			defer retryWg.Done()
+			for t := range ch {
+				retryCh <- t
+			}
+		}()
+	}
+
+	// Spin up parallel batch API workers. Each one takes a batch from
+	// batchCh, makes the batch API call, and submits objects to the
+	// shared download worker pool. This keeps the workers fully
+	// saturated instead of idling between sequential API calls.
+	var batchWg sync.WaitGroup
+	batchWg.Add(maxBatchWorkers)
+	for i := 0; i < maxBatchWorkers; i++ {
+		go func() {
+			defer batchWg.Done()
+			for b := range batchCh {
+				retries, newRetries, err := q.enqueueAndCollectRetriesFor(b)
+				if err != nil {
+					q.errorc <- err
+					if !errors.IsRetriableError(err) {
+						q.wait.Abort()
+						return
+					}
+				}
+				collectRetriesFrom(newRetries)
+				// Feed batch-level retries back for re-batching.
+				for _, t := range retries {
+					retryCh <- t
+				}
+			}
+		}()
+	}
+
+	// Producer: read from q.incoming, chunk into batches, and send to
+	// the parallel batch API workers via batchCh.
 	var closing bool
 	next := q.makeBatch()
-	pending := q.makeBatch()
 
 	for {
+		// Drain any accumulated retries into the next batch.
+	drainRetries:
+		for {
+			select {
+			case t := <-retryCh:
+				count := q.rc.Increment(t.Oid)
+				if !t.retryLaterTime.IsZero() {
+					t.ReadyTime = t.retryLaterTime
+					t.retryLaterTime = time.Time{}
+				} else {
+					t.ReadyTime = q.rc.ReadyTime(t.Oid)
+				}
+				tracerx.Printf("tq: enqueue retry #%d for %q (size: %d)", count, t.Oid, t.Size)
+				next = append(next, t)
+			default:
+				break drainRetries
+			}
+		}
+
 		for !closing && (len(next) < q.batchSize) {
 			t, ok := <-q.incoming
 			if !ok {
@@ -452,120 +523,112 @@ func (q *TransferQueue) collectBatches() {
 			next = append(next, t)
 		}
 
-		// Before enqueuing the next batch, sort by descending object
-		// size.
-		sort.Sort(sort.Reverse(next))
-
-		done := make(chan struct{})
-
-		var retries batch
-		var err error
-
-		go func() {
-			defer close(done)
-
-			if len(next) == 0 {
-				return
-			}
-
-			retries, err = q.enqueueAndCollectRetriesFor(next)
-			if err != nil {
-				q.errorc <- err
-			}
-		}()
-
-		var collected batch
-		collected, closing = q.collectPendingUntil(done)
-
-		// If we've encountered a serious error here, abort immediately;
-		// don't process further batches.  Abort the wait queue so that
-		// we don't deadlock waiting for objects to complete when they
-		// never will.
-		if err != nil && !errors.IsRetriableError(err) {
-			q.wait.Abort()
-			break
+		if len(next) > 0 {
+			sort.Sort(sort.Reverse(next))
+			batchCh <- next
+			next = q.makeBatch()
 		}
 
-		// Ensure the next batch is filled with, in order:
-		//
-		// - retries from the previous batch,
-		// - new additions that were enqueued behind retries, &
-		// - items collected while the batch was processing.
-		var minWaitTime time.Duration
-		next, pending, minWaitTime = retries.Concat(append(pending, collected...), q.batchSize)
-		if len(next) == 0 && len(pending) != 0 {
-			// There are some pending that could not be queued.
-			// Wait the requested time before resuming loop.
-			time.Sleep(minWaitTime)
-		} else if len(next) == 0 && len(pending) == 0 && closing {
-			// There are no items remaining, it is safe to break
+		if closing {
 			break
 		}
 	}
-}
 
-// collectPendingUntil collects items from q.incoming into a "pending" batch
-// until the given "done" channel is written to, or is closed.
-//
-// A "pending" batch is returned, along with whether or not "q.incoming" is
-// closed.
-func (q *TransferQueue) collectPendingUntil(done <-chan struct{}) (pending batch, closing bool) {
-	q.Upgrade()
+	// Signal batch workers that no more batches are coming.
+	close(batchCh)
 
+	// Continue draining retryCh while waiting for batch workers and
+	// retry collectors to finish. Without this, batch workers or
+	// collectRetriesFrom goroutines can block on sends to retryCh
+	// (which only has capacity batchSize), deadlocking batchWg.Wait().
+	done := make(chan struct{})
+	go func() {
+		batchWg.Wait()
+		retryWg.Wait()
+		close(done)
+	}()
+
+	var finalRetries []*objectTuple
 	for {
 		select {
-		case t, ok := <-q.incoming:
-			if !ok {
-				closing = true
-				<-done
-				return
-			}
-
-			pending = append(pending, t)
+		case t := <-retryCh:
+			finalRetries = append(finalRetries, t)
 		case <-done:
-			return
+			// All workers and collectors finished. Drain any
+			// remaining buffered retries.
+			close(retryCh)
+			for t := range retryCh {
+				finalRetries = append(finalRetries, t)
+			}
+			goto processFinalRetries
+		}
+	}
+
+processFinalRetries:
+	for _, t := range finalRetries {
+		count := q.rc.Increment(t.Oid)
+		if !t.retryLaterTime.IsZero() {
+			t.ReadyTime = t.retryLaterTime
+			t.retryLaterTime = time.Time{}
+		} else {
+			t.ReadyTime = q.rc.ReadyTime(t.Oid)
+		}
+		tracerx.Printf("tq: enqueue final retry #%d for %q (size: %d)", count, t.Oid, t.Size)
+		next = append(next, t)
+	}
+	if len(next) > 0 {
+		sort.Sort(sort.Reverse(next))
+		retries, newRetries, err := q.enqueueAndCollectRetriesFor(next)
+		if err != nil {
+			q.errorc <- err
+		}
+		// Drain download retries from the final batch. Since there
+		// are no more batching cycles, report them as errors.
+		if newRetries != nil {
+			for t := range newRetries {
+				retries = append(retries, t)
+			}
+		}
+		for _, t := range retries {
+			q.errorc <- fmt.Errorf("[%v] transfer failed after final batch", t.Oid)
+			q.Skip(t.Size)
+			q.wait.Done()
 		}
 	}
 }
 
-// enqueueAndCollectRetriesFor makes a Batch API call and returns a "next" batch
-// containing all of the objects that failed from the previous batch and had
-// retries available to them.
+// enqueueAndCollectRetriesFor makes a Batch API call, submits objects to the
+// transfer adapter, and returns:
+//   - a batch of objects that failed the batch API call and can be retried
+//   - a channel that yields retries from individual transfer failures
+//   - any non-retriable error
 //
-// If an error was encountered while making the API request, _all_ of the items
-// from the previous batch (that have retries available to them) will be
-// returned immediately, along with the error that was encountered.
-//
-// enqueueAndCollectRetriesFor blocks until the entire Batch "batch" has been
-// processed.
-func (q *TransferQueue) enqueueAndCollectRetriesFor(batch batch) (batch, error) {
+// It does NOT block on download completion; the returned retries channel
+// is read asynchronously by the caller, allowing the next batch API call
+// to proceed while downloads from this batch are still in flight.
+func (q *TransferQueue) enqueueAndCollectRetriesFor(batch batch) (batch, <-chan *objectTuple, error) {
 	q.Upgrade()
 
 	next := q.makeBatch()
 	tracerx.Printf("tq: sending batch of size %d", len(batch))
 
 	enqueueRetry := func(t *objectTuple, err error, readyTime *time.Time) {
-		count := q.rc.Increment(t.Oid)
-
-		if !t.retryLaterTime.IsZero() {
-			t.ReadyTime = t.retryLaterTime
-			t.retryLaterTime = time.Time{}
-		} else if readyTime == nil {
-			t.ReadyTime = q.rc.ReadyTime(t.Oid)
-		} else {
-			t.ReadyTime = *readyTime
+		// Do NOT increment the retry counter here. The counter is
+		// incremented when the item is drained from retryCh (in
+		// drainRetries or processFinalRetries), avoiding a double count.
+		if readyTime != nil {
+			t.retryLaterTime = *readyTime
 		}
-		delay := time.Until(t.ReadyTime).Seconds()
 
+		count := q.rc.CountFor(t.Oid)
 		var errMsg string
 		if err != nil {
 			errMsg = fmt.Sprintf(": %s", err)
 		}
-		tracerx.Printf("tq: enqueue retry #%d after %.2fs for %q (size: %d)%s", count, delay, t.Oid, t.Size, errMsg)
+		tracerx.Printf("tq: enqueue batch retry for %q (size: %d, retries so far: %d)%s", t.Oid, t.Size, count, errMsg)
 		next = append(next, t)
 	}
 
-	q.meter.Pause()
 	var bRes *BatchResponse
 	manifest := q.manifest.Upgrade()
 	if manifest.standaloneTransferAgent != "" {
@@ -603,15 +666,15 @@ func (q *TransferQueue) enqueueAndCollectRetriesFor(batch batch) (batch, error) 
 			// was not enqueued for retrial at a later point.
 			// Make sure to return an error which causes all other objects to be retried.
 			if hasNonRetriableObjects {
-				return next, errors.NewRetriableError(err)
+				return next, nil, errors.NewRetriableError(err)
 			} else {
-				return next, nil
+				return next, nil, nil
 			}
 		}
 	}
 
 	if len(bRes.Objects) == 0 {
-		return next, nil
+		return next, nil, nil
 	}
 
 	// We check first that all of the objects we want to upload are present,
@@ -625,23 +688,22 @@ func (q *TransferQueue) enqueueAndCollectRetriesFor(batch batch) (batch, error) 
 			// missing in that case, since we don't need to upload
 			// it.
 			if len(o.Actions) != 0 {
-				q.trMutex.Lock()
+				q.trMutex.RLock()
 				objects, ok := q.transfers[o.Oid]
-				q.trMutex.Unlock()
+				q.trMutex.RUnlock()
 				// We expect only one objectTuple in this list
 				// as the uploadContext methods deduplicate
 				// identical OIDs before adding them to the
 				// transfer queue.
 				if ok && objects.First().Missing {
 					tracerx.Printf("tq: stopping batched queue, object %q missing locally and on remote", o.Oid)
-					return nil, newObjectMissingError(objects.First().Name, o.Oid)
+					return nil, nil, newObjectMissingError(objects.First().Name, o.Oid)
 				}
 			}
 		}
 	}
 
 	q.useAdapter(bRes.TransferAdapterName)
-	q.meter.Start()
 
 	toTransfer := make([]*Transfer, 0, len(bRes.Objects))
 
@@ -654,9 +716,9 @@ func (q *TransferQueue) enqueueAndCollectRetriesFor(batch batch) (batch, error) 
 			continue
 		}
 
-		q.trMutex.Lock()
+		q.trMutex.RLock()
 		objects, ok := q.transfers[o.Oid]
-		q.trMutex.Unlock()
+		q.trMutex.RUnlock()
 		if !ok {
 			// If we couldn't find any associated
 			// Transfer object, then we give up on the
@@ -690,12 +752,11 @@ func (q *TransferQueue) enqueueAndCollectRetriesFor(batch batch) (batch, error) 
 		}
 	}
 
+	// Submit transfers to the adapter without blocking. The returned
+	// channel will yield retries as individual transfers complete or fail.
 	retries := q.addToAdapter(bRes.endpoint, toTransfer)
-	for t := range retries {
-		enqueueRetry(t, nil, nil)
-	}
 
-	return next, nil
+	return next, retries, nil
 }
 
 // makeBatch returns a new, empty batch, with a capacity equal to the maximum
@@ -817,9 +878,9 @@ func (q *TransferQueue) handleTransferResult(
 			// after a certain period of time, send it to
 			// the retry channel with a time when it's ready.
 			tracerx.Printf("tq: retrying object %s after %.2fs", oid, time.Until(readyTime).Seconds())
-			q.trMutex.Lock()
+			q.trMutex.RLock()
 			objects, ok := q.transfers[oid]
-			q.trMutex.Unlock()
+			q.trMutex.RUnlock()
 
 			if ok {
 				t := objects.First()
@@ -834,9 +895,9 @@ func (q *TransferQueue) handleTransferResult(
 			// its retry count will be incremented.
 			tracerx.Printf("tq: retrying object %s: %s", oid, res.Error)
 
-			q.trMutex.Lock()
+			q.trMutex.RLock()
 			objects, ok := q.transfers[oid]
-			q.trMutex.Unlock()
+			q.trMutex.RUnlock()
 
 			if ok {
 				retries <- objects.First()
@@ -890,14 +951,16 @@ func (q *TransferQueue) useAdapter(name string) {
 	defer q.adapterInitMutex.Unlock()
 
 	if q.adapter != nil {
-		if q.adapter.Name() == name {
-			// re-use, this is the normal path
+		// Reuse the current adapter if the name matches, or if the
+		// server returned no adapter name (empty string means "use
+		// default", which is what we already have).
+		if name == "" || q.adapter.Name() == name {
 			return
 		}
 		// If the adapter we're using isn't the same as the one we've been
-		// told to use now, must wait for the current one to finish then switch
+		// told to use now, must wait for the current one to finish then switch.
 		// This will probably never happen but is just in case server starts
-		// changing adapter support in between batches
+		// changing adapter support in between batches.
 		q.finishAdapter()
 	}
 	q.adapter = q.manifest.NewAdapterOrDefault(name, q.direction)

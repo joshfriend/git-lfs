@@ -1,6 +1,7 @@
 package tq
 
 import (
+	"runtime"
 	"strings"
 	"sync"
 
@@ -12,9 +13,12 @@ import (
 )
 
 const (
-	defaultMaxRetries          = 8
-	defaultMaxRetryDelay       = 10
-	defaultConcurrentTransfers = 8
+	defaultMaxRetries    = 8
+	defaultMaxRetryDelay = 10
+
+	minConcurrentTransfers         = 8
+	maxConcurrentTransfers         = 384
+	defaultConcurrentBatchRequests = 4
 )
 
 type Manifest interface {
@@ -22,6 +26,7 @@ type Manifest interface {
 	MaxRetries() int
 	MaxRetryDelay() int
 	ConcurrentTransfers() int
+	ConcurrentBatchRequests() int
 	IsStandaloneTransfer() bool
 	batchClient() BatchClient
 	GetAdapterNames(dir Direction) []string
@@ -69,6 +74,10 @@ func (m *lazyManifest) MaxRetryDelay() int {
 
 func (m *lazyManifest) ConcurrentTransfers() int {
 	return m.Upgrade().ConcurrentTransfers()
+}
+
+func (m *lazyManifest) ConcurrentBatchRequests() int {
+	return m.Upgrade().ConcurrentBatchRequests()
 }
 
 func (m *lazyManifest) IsStandaloneTransfer() bool {
@@ -133,6 +142,7 @@ type concreteManifest struct {
 	maxRetries              int
 	maxRetryDelay           int
 	concurrentTransfers     int
+	concurrentBatchRequests int
 	basicTransfersOnly      bool
 	standaloneTransferAgent string
 	tusTransfersAllowed     bool
@@ -161,6 +171,10 @@ func (m *concreteManifest) ConcurrentTransfers() int {
 	return m.concurrentTransfers
 }
 
+func (m *concreteManifest) ConcurrentBatchRequests() int {
+	return m.concurrentBatchRequests
+}
+
 func (m *concreteManifest) IsStandaloneTransfer() bool {
 	return m.standaloneTransferAgent != ""
 }
@@ -178,6 +192,21 @@ func (m *concreteManifest) Upgrade() *concreteManifest {
 
 func (m *concreteManifest) Upgraded() bool {
 	return true
+}
+
+// defaultConcurrentTransfers scales with CPU count, clamped to a
+// reasonable range. Downloads are I/O-bound (network + disk) so we use
+// 3× NCPU to keep many connections saturated while a few are stalled on
+// TLS handshakes or server latency.
+func defaultConcurrentTransfers() int {
+	n := runtime.NumCPU() * 3
+	if n < minConcurrentTransfers {
+		return minConcurrentTransfers
+	}
+	if n > maxConcurrentTransfers {
+		return maxConcurrentTransfers
+	}
+	return n
 }
 
 func NewManifest(f *fs.Filesystem, apiClient *lfsapi.Client, operation, remote string) Manifest {
@@ -220,6 +249,9 @@ func newConcreteManifest(f *fs.Filesystem, apiClient *lfsapi.Client, operation, 
 		if v := git.Int("lfs.concurrenttransfers", 0); v > 0 {
 			m.concurrentTransfers = v
 		}
+		if v := git.Int("lfs.concurrentbatchrequests", 0); v > 0 {
+			m.concurrentBatchRequests = v
+		}
 		m.basicTransfersOnly = git.Bool("lfs.basictransfersonly", false)
 		m.standaloneTransferAgent = findStandaloneTransfer(
 			apiClient, operation, remote,
@@ -236,7 +268,10 @@ func newConcreteManifest(f *fs.Filesystem, apiClient *lfsapi.Client, operation, 
 	}
 
 	if m.concurrentTransfers < 1 {
-		m.concurrentTransfers = defaultConcurrentTransfers
+		m.concurrentTransfers = defaultConcurrentTransfers()
+	}
+	if m.concurrentBatchRequests < 1 {
+		m.concurrentBatchRequests = defaultConcurrentBatchRequests
 	}
 
 	if sshTransfer != nil {
