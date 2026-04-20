@@ -303,9 +303,11 @@ func (infile *FileInput) writeLFSPointer(repo *Repo, inputData io.Reader) (*lfs.
 		return nil, errors.Wrap(err, "local media path")
 	}
 
-	if _, err := os.Stat(mediafile); err != nil {
-		if err := os.Rename(tmpfile, mediafile); err != nil {
-			return nil, err
+	if tmpfile != "" {
+		if _, err := os.Stat(mediafile); err != nil {
+			if err := os.Rename(tmpfile, mediafile); err != nil {
+				return nil, err
+			}
 		}
 	}
 

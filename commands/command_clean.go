@@ -73,7 +73,11 @@ func clean(gf *lfs.GitFilter, to io.Writer, from io.Reader, fileName string, fil
 		Panic(err, tr.Tr.Get("Unable to get local media path."))
 	}
 
-	if stat, _ := os.Stat(mediafile); stat != nil {
+	if tmpfile == "" {
+		// No temp file was created because the object already exists
+		// in the local store (hash-only optimization).
+		tracerx.Printf("%s exists (hash-only)", mediafile)
+	} else if stat, _ := os.Stat(mediafile); stat != nil {
 		if stat.Size() != cleaned.Size && len(cleaned.Pointer.Extensions) == 0 {
 			Exit("%s\n%s\n%s", tr.Tr.Get("Files don't match:"), mediafile, tmpfile)
 		}
